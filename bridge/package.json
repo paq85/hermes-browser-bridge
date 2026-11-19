@@ -1,0 +1,13 @@
+{
+  "name": "hermes-browser-bridge",
+  "version": "0.4.1",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "MCP server that relays Hermes Agent browser commands to the Hermes Browser Bridge extension. No dependencies to install: ws is vendored in vendor/ws.",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test/e2e.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

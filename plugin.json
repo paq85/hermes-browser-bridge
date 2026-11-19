@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "hermes-browser-bridge",
+  "version": "0.4.1",
+  "description": "Use the user's real, signed-in Chrome or Edge through a browser extension instead of a remote-debugging port. Adds tab, navigation, page-reading, screenshot, click, typing, image-paste and GIF-recording tools, with per-site permission prompts.",
+  "license": "MIT",
+  "author": { "name": "paq85", "url": "https://github.com/paq85" },
+  "homepage": "https://github.com/paq85/hermes-browser-bridge",
+  "repository": "https://github.com/paq85/hermes-browser-bridge",
+  "keywords": ["browser", "chrome", "extension", "automation", "mcp"],
+  "extensions": {
+    "com.nousresearch.hermes": {
+      "servers": {
+        "chrome": { "timeout": 150 }
+      }
+    }
+  }
+}

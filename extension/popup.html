@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hermes Browser Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>Hermes Browser Bridge</h1>
+    <label class="switch">
+      <input type="checkbox" id="enabled">
+      <span>Allow Hermes</span>
+    </label>
+  </header>
+  <p id="status" class="status" role="status">Checking…</p>
+
+  <section id="tabs-section" hidden>
+    <h2>Tabs Hermes is working in (● = debugger attached)</h2>
+    <ul id="tabs"></ul>
+    <button id="detach" type="button">Release all tabs</button>
+  </section>
+
+  <section>
+    <h2>Sites</h2>
+    <label class="row"><input type="radio" name="mode" value="ask"> Ask me the first time Hermes uses a site</label>
+    <label class="row"><input type="radio" name="mode" value="all"> Allow all sites without asking</label>
+    <p class="muted">Blocked sites below stay blocked in either mode.</p>
+    <ul id="rules"></ul>
+    <p id="no-rules" class="muted" hidden>No sites decided yet.</p>
+  </section>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hermes wants to use a site</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body class="prompt">
+  <h1>Let Hermes use this site?</h1>
+  <p class="host" id="host"></p>
+  <p class="muted">Hermes will be able to read pages on this site and act on them as you: click, type, fill in forms and take screenshots.</p>
+  <div class="buttons">
+    <button id="always" type="button" class="primary">Always allow</button>
+    <button id="session" type="button">Allow until I close the browser</button>
+    <button id="deny" type="button">Not now</button>
+  </div>
+  <p class="muted links">
+    <button id="block" type="button" class="link">Never allow this site</button>
+    <button id="all" type="button" class="link">Allow all sites from now on (stop asking)</button>
+  </p>
+  <script src="permission.js"></script>
+</body>
+</html>

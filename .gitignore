@@ -1,0 +1,3 @@
+# Pairing token, written by the bridge on first run. Never commit it.
+extension/config.json
+node_modules/
