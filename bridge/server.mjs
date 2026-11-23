@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from './vendor/ws/wrapper.mjs';
 import { TOOLS, INSTRUCTIONS } from './tools.mjs';
 
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 const DEFAULT_PORT = 38917;
 const CONNECT_WAIT_MS = 40_000; // the extension retries every 30 s
 const CALL_TIMEOUT_MS = 60_000;
@@ -33,6 +33,159 @@ const EXTENSION_COPY = path.join(process.env.HERMES_BROWSER_BRIDGE_EXTENSION_DIR
 
 const OUTPUT_DIR = process.env.HERMES_BROWSER_BRIDGE_OUTPUT_DIR || path.join(os.homedir(), '.hermes-browser-bridge', 'recordings');
 const IMAGE_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+// Content types for uploads, so pages that check file.type see what a real picker gives them.
+const MIME_TYPES = {
+  ...IMAGE_TYPES, '.svg': 'image/svg+xml', '.bmp': 'image/bmp', '.ico': 'image/x-icon', '.tif': 'image/tiff', '.tiff': 'image/tiff', '.heic': 'image/heic', '.avif': 'image/avif',
+  '.txt': 'text/plain', '.csv': 'text/csv', '.tsv': 'text/tab-separated-values', '.md': 'text/markdown', '.html': 'text/html', '.htm': 'text/html',
+  '.css': 'text/css', '.js': 'text/javascript', '.json': 'application/json', '.xml': 'application/xml', '.yaml': 'application/yaml', '.yml': 'application/yaml',
+  '.pdf': 'application/pdf', '.zip': 'application/zip', '.gz': 'application/gzip', '.7z': 'application/x-7z-compressed', '.rar': 'application/vnd.rar',
+  '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.odt': 'application/vnd.oasis.opendocument.text', '.ods': 'application/vnd.oasis.opendocument.spreadsheet', '.rtf': 'application/rtf',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.avi': 'video/x-msvideo',
+};
+const CONTENT_LIMIT = 25 * 1024 * 1024; // when files must travel by content rather than by path
+
+function expandHome(p) {
+  return p === '~' ? os.homedir() : /^~[\\/]/.test(p) ? path.join(os.homedir(), p.slice(2)) : p;
+}
+
+// Normalises the ways an agent may write a local path, and refuses the ones
+// that are ambiguous or reach beyond this computer.
+function normaliseUploadPath(raw) {
+  let p = String(raw).trim().replace(/^"(.*)"$/, '$1');
+  if (/^file:\/\//i.test(p)) {
+    try { p = fileURLToPath(p); } catch { throw new Error(`Not a usable file URL: "${raw}". Pass a plain absolute path.`); }
+  }
+  p = expandHome(p);
+  if (process.platform === 'win32') {
+    // Network shares and device paths would make this computer contact another machine.
+    if (/^[\\/]{2}/.test(p)) throw new Error(`Network and device paths are not allowed for uploads (got "${raw}"). Copy the file to this computer first.`);
+    // Git Bash / MSYS style: /c/Users/... means C:\Users\...
+    const msys = /^\/([a-zA-Z])(\/|$)/.exec(p);
+    if (msys) p = `${msys[1].toUpperCase()}:\\${p.slice(3).replace(/\//g, '\\')}`;
+    if (!/^[a-zA-Z]:[\\/]/.test(p)) throw new Error(`Use a full path with a drive letter, like C:\\Users\\me\\file.pdf (got "${raw}").`);
+  } else if (!path.isAbsolute(p)) {
+    throw new Error(`Use an absolute path (got "${raw}"). Relative paths are ambiguous here.`);
+  }
+  return path.resolve(p);
+}
+
+// Checks every path before the browser sees it, so mistakes come back as
+// clear messages instead of an empty or half-filled upload.
+function resolveUploadPaths(paths) {
+  const list = Array.isArray(paths) ? paths : typeof paths === 'string' ? [paths] : [];
+  if (!list.length) throw new Error('paths is required: absolute paths of the files to upload.');
+  if (list.length > 100) throw new Error('At most 100 files per upload.');
+  return list.map((raw) => {
+    const abs = normaliseUploadPath(raw);
+    let st;
+    try { st = fs.statSync(abs); } catch { throw new Error(`No such file: ${abs}`); }
+    if (!st.isFile() && !st.isDirectory()) throw new Error(`Not a regular file or folder: ${abs}`);
+    return {
+      path: abs, name: path.basename(abs), size: st.isFile() ? st.size : 0, isDir: st.isDirectory(),
+      type: st.isFile() ? (MIME_TYPES[path.extname(abs).toLowerCase()] || '') : '', lastModified: Math.round(st.mtimeMs),
+      ...(st.isDirectory() ? { children: listFolder(abs) } : {}),
+    };
+  });
+}
+
+// Every regular file inside a folder (recursively, not following links out of
+// it), for passing a folder by content.
+function listFolder(dir, out = [], limit = 5000, depth = 0) {
+  if (depth > 32) return out;
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    if (out.length >= limit) break;
+    if (e.isSymbolicLink()) continue;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) listFolder(p, out, limit, depth + 1);
+    else if (e.isFile()) out.push(p);
+  }
+  return out;
+}
+
+// Reads a file, stopping once it is larger than `budget` bytes (stat sizes
+// can be wrong or change), in chunks so small files stay cheap.
+function readCapped(p, budget) {
+  const fd = fs.openSync(p, 'r');
+  try {
+    const parts = [];
+    let total = 0;
+    const chunk = Buffer.alloc(1024 * 1024);
+    for (let r; (r = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0;) {
+      parts.push(Buffer.from(chunk.subarray(0, r)));
+      total += r;
+      if (total > budget) break;
+    }
+    return Buffer.concat(parts, total);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Reads files (and the files inside folders, with their path inside the
+// folder) for passing by content, within the 25 MB limit.
+function readUploadBytes(files, why, fix) {
+  const entries = [];
+  for (const f of files) {
+    if (!f.isDir) { entries.push({ p: f.path, rel: '' }); continue; }
+    for (const p of f.children || []) entries.push({ p, rel: [f.name, ...path.relative(f.path, p).split(path.sep)].join('/') });
+  }
+  if (entries.length > 1000) throw new Error(`${why} That is ${entries.length} files, more than the 1000 that can be passed by content. ${fix}`);
+  let left = CONTENT_LIMIT;
+  return entries.map(({ p, rel }) => {
+    const buf = readCapped(p, left);
+    if (buf.length > left) throw new Error(`${why} These files total more than the 25 MB that can be passed by content. ${fix}`);
+    left -= buf.length;
+    const st = fs.statSync(p);
+    return { name: path.basename(p), rel, type: MIME_TYPES[path.extname(p).toLowerCase()] || '', lastModified: Math.round(st.mtimeMs), data: buf.toString('base64') };
+  });
+}
+
+const ACCESS_FIX = 'Turn on "Allow access to file URLs" for Hermes Browser Bridge on the browser\'s extensions page (Details), then try again.';
+const SMALLER_FIX = 'Pass fewer or smaller files.';
+
+// upload_file: the bridge checks the paths, then the extension does the
+// upload. When the extension can only take the files' contents (a setting is
+// off, a folder, or a File System Access picker), it says so with a code and
+// the bridge resends the same request with the contents, tied to the picker
+// the first attempt opened.
+async function uploadFile(args) {
+  // Only the documented arguments reach the extension; the rest is set here.
+  const pick = (o) => Object.fromEntries(['ref', 'x', 'y', 'via', 'cancel', 'clear', 'tabId'].filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
+  if (args.cancel || args.clear) return callBrowser('upload_file', pick(args));
+  const files = resolveUploadPaths(args.paths);
+  const base = pick(args);
+  if ((base.via === 'drop' || base.via === 'paste') && files.some((f) => f.isDir)) {
+    throw new Error(`Folders cannot be ${base.via === 'drop' ? 'dropped' : 'pasted'}; pass the files inside it instead (or use the page's folder upload input).`);
+  }
+  let call = { ...base, files };
+  if (call.via === 'paste') call.bytes = readUploadBytes(files, "Pasting needs the files' contents.", SMALLER_FIX);
+  let tip = '';
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const r = await callBrowser('upload_file', call);
+      return tip ? { ...r, text: `${r?.text || ''}\n${tip}` } : r;
+    } catch (e) {
+      const m = /^(FILE_ACCESS_DENIED|FOLDER_BY_CONTENT|FSA_PICKER)(?:#(\w+))?:/.exec(String(e.message));
+      if (!m || attempt >= 3) throw e;
+      const [, code, picker] = m;
+      if (picker) call = { ...call, retryPicker: picker };
+      if (code === 'FSA_PICKER') {
+        if (files.some((f) => f.isDir)) throw new Error('This page\'s file picker takes files, not a folder. Pass the files.');
+        call = { ...call, fsaFiles: call.fsaFiles || readUploadBytes(files, "This page uses the File System Access picker, which can only be answered with the files' contents.", SMALLER_FIX) };
+      } else if (code === 'FOLDER_BY_CONTENT') {
+        call = { ...call, bytes: readUploadBytes(files, 'This browser does not list folders handed over by an extension, so the folder\'s files are passed by content.', 'Upload the files individually, or a smaller folder.'), bytesReason: 'folder' };
+      } else {
+        call = { ...call, bytes: call.bytes || readUploadBytes(files, 'The extension is not allowed to read local files.', ACCESS_FIX), bytesReason: 'access' };
+        tip = 'Tip: turn on "Allow access to file URLs" for Hermes Browser Bridge (browser extensions page > Details) to upload by path: any size, and the same events a real file picker produces.';
+      }
+    }
+  }
+}
 
 const log = (...a) => process.stderr.write(`[hermes-browser-bridge ${process.pid}] ${a.join(' ')}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -273,7 +426,7 @@ async function callTool(name, args) {
     const { path: _omit, ...rest } = args;
     args = { ...rest, image: { data: fs.readFileSync(file).toString('base64'), mimeType, name: path.basename(file) } };
   }
-  const r = (await callBrowser(name, args)) || {};
+  const r = (name === 'upload_file' ? await uploadFile(args) : await callBrowser(name, args)) || {};
   const content = [];
   if (r.text) content.push({ type: 'text', text: String(r.text) });
   if (r.file) {

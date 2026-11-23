@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Upload frame</title></head>
+<body style="font: 13px system-ui, sans-serif; margin: 6px">
+<button id="frameBtn" type="button">Frame upload button</button>
+<input type="file" id="frameInput" hidden>
+<div id="frameDrop" role="region" aria-label="Frame drop zone" style="display:inline-block;width:140px;height:40px;background:#efe;border:1px dashed">Frame drop</div>
+<button id="frameFsa" type="button">Frame file system picker</button>
+<script>
+  if (location.hostname === 'localhost') {
+    const nested = document.createElement('iframe');
+    nested.src = 'http://[::1]:' + location.port + '/upload-nested';
+    nested.title = 'nested upload frame';
+    nested.style.cssText = 'width:300px;height:50px;border:1px solid';
+    document.body.appendChild(nested);
+  }
+</script>
+<script>
+  frameFsa.addEventListener('click', async () => {
+    try {
+      const [h] = await window.showOpenFilePicker();
+      const f = await h.getFile();
+      parent.postMessage({ __uploadLab: { source: 'fsapi@' + location.host.split(':')[0], trusted: null, files: [{ name: f.name, size: f.size, type: f.type, rel: '', head: (await f.text()).slice(0, 40) }] } }, '*');
+    } catch (err) {
+      parent.postMessage({ __uploadLab: { source: 'fsapi-error@' + location.host.split(':')[0], error: err.name, files: [] } }, '*');
+    }
+  });
+  // Reports to the parent page's log, whichever origin this frame has.
+  const report = async (source, ev, files) => {
+    const list = await Promise.all([...files].map(async (f) => ({ name: f.name, size: f.size, type: f.type, rel: '', head: (await f.text()).slice(0, 40) })));
+    parent.postMessage({ __uploadLab: { source: source + '@' + location.host.split(':')[0], trusted: ev.isTrusted, files: list } }, '*');
+  };
+  frameBtn.addEventListener('click', () => frameInput.click());
+  frameInput.addEventListener('change', (e) => report('frame', e, frameInput.files));
+  frameDrop.addEventListener('dragover', (e) => e.preventDefault());
+  frameDrop.addEventListener('drop', (e) => { e.preventDefault(); report('frameDrop', e, e.dataTransfer.files); frameDrop.textContent = 'Got ' + e.dataTransfer.files.length; });
+</script>
+</body>
+</html>

@@ -20,6 +20,7 @@ function render(s) {
     status.className = 'status warn';
   }
 
+  $('fileaccess').hidden = s.fileAccess !== false;
   $('tabs-section').hidden = !s.tabs.length;
   $('tabs').replaceChildren(...s.tabs.map((t) => {
     const li = document.createElement('li');

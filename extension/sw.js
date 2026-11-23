@@ -2,6 +2,7 @@ import {
   pageSnapshot, pageLocate, pageSetValue, pageSelectAllInFocused, pageText,
   pageScrollProbe, pageScrollFinish, pageIndicator, pageViewport, pageTag,
   pageFramePrep, pageFrameOffset, pageFrameText, pagePutImage, pageFrameMark, pageFrameAt,
+  pageDropGuard, pageFsaShim, pageFsaUsed,
 } from './page-fns.js';
 import { siteKey, matchRule } from './sites.js';
 import { encodeGif } from './gif.js';
@@ -45,6 +46,7 @@ start();
 
 async function start() {
   try {
+    await releaseOrphans();
     if (!(await chrome.alarms.get('tick'))) await chrome.alarms.create('tick', { periodInMinutes: 0.5 });
     await connect();
   } catch (e) {
@@ -60,7 +62,8 @@ async function tick() {
 async function sweep() {
   const now = Date.now();
   for (const [tabId, s] of sessions) {
-    const limit = s.tracking || recordings.get(tabId)?.on ? TRACKING_IDLE_MS : DETACH_IDLE_MS;
+    const openPicker = s.fc?.pending && !s.fc.pending.done && s.fc.pending.intercepted && Date.now() - s.fc.pending.at < PENDING_TTL_MS;
+    const limit = s.tracking || recordings.get(tabId)?.on || openPicker ? TRACKING_IDLE_MS : DETACH_IDLE_MS;
     if (s.busy || s.dialog || now - s.lastUse < limit) continue;
     sessions.delete(tabId);
     try { await chrome.debugger.detach({ tabId }); } catch { /* already gone */ }
@@ -154,8 +157,16 @@ async function onSocketMessage(sock, cfg, nonce, raw) {
         const fn = HANDLERS[m.method];
         if (!fn) throw new Error(`Unknown method ${m.method}. The extension may be older than the plugin: reload it on the browser's extensions page.`);
         const ctx = {}; // per-call scratch: the resolved tab and click point, for recordings
+        const callStart = Date.now();
         const result = await fn(m.params || {}, ctx);
         if (RECORDED.has(m.method) && recordings.get(ctx.tabId)?.on) await recordFrame(ctx.tabId, ctx.pt).catch(() => {});
+        if (ctx.tabId != null && sessions.has(ctx.tabId)) {
+          // Most pickers open at once; give ones opened after an await a moment.
+          const lp = livePending(ctx.tabId);
+          if (!(lp && lp.at >= callStart) && (sessions.get(ctx.tabId)?.fc?.armedUntil || 0) > Date.now() && /^(click|press_key|type|evaluate)$/.test(m.method)) await sleep(150);
+          const note = await chooserNotice(ctx.tabId).catch(() => '');
+          if (note && result && typeof result === 'object') result.text = (result.text ? result.text + '\n\n' : '') + note;
+        }
         reply = { id: m.id, result };
       } catch (e) {
         reply = { id: m.id, error: String(e?.message || e) };
@@ -353,8 +364,18 @@ async function fullSnapshot(tabId, opts) {
   };
   let text = render(top, '', true).join('\n');
   frameInfo.set(tabId, info);
+  // Every frame's list of file inputs not shown in the outline is gathered at
+  // the end, and kept even when the outline is cut: upload_file needs those refs.
+  const fileLines = [];
+  text = text.split('\n').filter((line) => {
+    const t = line.trim();
+    if (t.startsWith('Hidden file inputs (')) return false;
+    if (/^- file-input \((hidden|not shown above)\)/.test(t)) { fileLines.push(t); return false; }
+    return true;
+  }).join('\n').replace(/\n{3,}/g, '\n\n').trimEnd();
   const max = opts.maxChars || 30000;
   if (text.length > max) text = text.slice(0, max) + `\n… snapshot truncated at ${max} characters. Use interactiveOnly, find, or get_text.`;
+  if (fileLines.length) text += '\n\nHidden file inputs (pass their ref to upload_file; no file picker opens):\n' + fileLines.join('\n');
   return text;
 }
 
@@ -399,7 +420,9 @@ function ensureAttached(tabId) {
     // Runtime.enable replays the page's stored console messages, so console
     // history is available even though we attach late.
     for (const [method, params] of [
-      ['Page.enable', {}], ['Runtime.enable', {}], ['Emulation.setFocusEmulationEnabled', { enabled: true }],
+      // enableFileChooserOpenedEvent reports pickers without blocking them. Every
+      // Page.enable must pass it: a plain Page.enable switches it off again.
+      ['Page.enable', { enableFileChooserOpenedEvent: true }], ['Runtime.enable', {}], ['Emulation.setFocusEmulationEnabled', { enabled: true }],
       // Cross-site frames run in their own process. In a background tab the
       // browser does not route mouse input into them, so we get a session per
       // frame and send input there directly.
@@ -414,6 +437,7 @@ function ensureAttached(tabId) {
 
 async function cdp(tabId, method, params = {}, timeoutMs = 15000, sessionId = undefined) {
   await ensureAttached(tabId);
+  if (grantsActivation(method, params)) await armChooser(tabId);
   const s = sessions.get(tabId);
   const hint = s?.dialog ? ` A JavaScript ${s.dialog.type} dialog is open ("${s.dialog.message}"); call handle_dialog first.` : '';
   if (s) s.busy++;
@@ -464,6 +488,574 @@ async function inputTarget(tabId, pt) {
   return { sid: undefined, x: pt.x, y: pt.y };
 }
 
+// ------------------------------------------------------------ file pickers
+//
+// When Hermes clicks something that opens a file picker, the system dialog
+// would appear on the user's screen and Hermes could not operate it. Instead,
+// file-picker interception is switched on for a short window around each of
+// Hermes' own input actions (a picker can only open within 5 s of the input
+// that triggers it), and off again straight after. The picker is then
+// reported to Hermes, which fills it with upload_file. Pickers the user opens
+// outside that window are never touched.
+
+const CHOOSER_WINDOW_MS = 5300;
+const PENDING_TTL_MS = 2 * 60_000;
+let pickerSeq = 0;
+const sidKey = (sid) => sid || 'top';
+const dbgTarget = (tabId, sid) => (sid ? { tabId, sessionId: sid } : { tabId });
+
+function grantsActivation(method, params) {
+  if (method === 'Input.dispatchMouseEvent') return params.type === 'mousePressed' || params.type === 'mouseReleased';
+  if (method === 'Input.dispatchKeyEvent' || method === 'Input.insertText') return true;
+  return (method === 'Runtime.evaluate' || method === 'Runtime.callFunctionOn') && !!params.userGesture;
+}
+
+function fcState(s) {
+  return (s.fc ||= { armedUntil: 0, armedSids: new Set(), timer: null, pending: null, waiters: [] });
+}
+
+async function armChooser(tabId) {
+  const s = sessions.get(tabId);
+  if (!s) return;
+  const fc = fcState(s);
+  fc.armedUntil = Date.now() + CHOOSER_WINDOW_MS;
+  const sids = [undefined, ...s.children.keys()].filter((sid) => !fc.armedSids.has(sidKey(sid)));
+  await Promise.all(sids.map(async (sid) => {
+    fc.armedSids.add(sidKey(sid));
+    try {
+      await withTimeout(chrome.debugger.sendCommand(dbgTarget(tabId, sid), 'Page.setInterceptFileChooserDialog', { enabled: true }), 3000, 'timeout');
+    } catch {
+      fc.armedSids.delete(sidKey(sid)); // that frame is gone
+    }
+  }));
+  clearTimeout(fc.timer);
+  fc.timer = setTimeout(() => { disarmChooser(tabId, fc); }, Math.max(50, fc.armedUntil - Date.now() + 50));
+}
+
+function disarmChooser(tabId, which) {
+  const fc = sessions.get(tabId)?.fc;
+  if (!fc || (which && which !== fc)) return;
+  clearTimeout(fc.timer);
+  fc.timer = null;
+  fc.armedUntil = 0;
+  for (const k of fc.armedSids) {
+    chrome.debugger.sendCommand(dbgTarget(tabId, k === 'top' ? undefined : k), 'Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+  }
+  fc.armedSids.clear();
+}
+
+function livePending(tabId) {
+  const p = sessions.get(tabId)?.fc?.pending;
+  if (!p || Date.now() - p.at > PENDING_TTL_MS) return null;
+  return p;
+}
+
+// After an upload to an explicit target succeeds, an older unanswered picker
+// is stale: it must not be filled later by an upload_file without a target.
+function retireStalePickers(tabId, keepId) {
+  const p = livePending(tabId);
+  if (p && p.id !== keepId && !p.done) { p.done = true; p.reported = true; }
+}
+
+function waitChooser(tabId, since, ms) {
+  const s = sessions.get(tabId);
+  if (!s) return Promise.resolve(null);
+  const fc = fcState(s);
+  if (fc.pending && fc.pending.at >= since) return Promise.resolve(fc.pending);
+  return new Promise((resolve) => {
+    const done = (p) => { clearTimeout(t); resolve(p); };
+    const t = setTimeout(() => { fc.waiters = fc.waiters.filter((w) => w !== done); resolve(null); }, ms);
+    fc.waiters.push(done);
+  });
+}
+
+// Runs a function on a page element held by the debugger (by backendNodeId or objectId).
+async function callOnNode(tabId, sid, node, fnDecl, args = []) {
+  let objectId = node.objectId;
+  if (!objectId) {
+    let r;
+    try {
+      r = await cdp(tabId, 'DOM.resolveNode', { backendNodeId: node.backendNodeId, objectGroup: 'hermes-upload' }, 15000, sid);
+    } catch (e) { throw uploadError(e); }
+    objectId = r?.object?.objectId;
+    if (!objectId) throw new Error(STALE_NODE);
+  }
+  const r = await cdp(tabId, 'Runtime.callFunctionOn', {
+    objectId, functionDeclaration: fnDecl, arguments: args.map((value) => ({ value })), returnByValue: true, awaitPromise: true,
+  }, 60000, sid);
+  if (r.exceptionDetails) throw new Error('Page script error: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'unknown'));
+  return r.result?.value;
+}
+
+function releaseUploadObjects(tabId, sid) {
+  if (sessions.has(tabId)) cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: 'hermes-upload' }, 5000, sid).catch(() => {});
+}
+
+const STALE_NODE = 'The upload input was removed or re-created by the page (common after each upload). Call upload_file again with the Upload button\'s ref.';
+const FILE_ACCESS = 'FILE_ACCESS_DENIED: "Allow access to file URLs" is off for Hermes Browser Bridge, so files cannot be passed by path.';
+
+function uploadError(e) {
+  const msg = String(e?.message || e);
+  if (/Not allowed/i.test(msg)) return new Error(FILE_ACCESS);
+  if (/No node (found )?with given (backend )?id|No node found for given backend id|Could not find node/i.test(msg)) return new Error(STALE_NODE);
+  if (/Node is not a file input element/i.test(msg)) return new Error('That element is not a file input. Pass the Upload button\'s ref instead (it is clicked and the picker is answered), or via: "drop" for a drop zone.');
+  return e instanceof Error ? e : new Error(msg);
+}
+
+// The bridge resends some uploads with the files' contents; the picker id in
+// the message makes that retry go to the same picker and nowhere else.
+function withPickerId(e, id) {
+  const msg = String(e?.message || e);
+  const m = /^(FILE_ACCESS_DENIED|FOLDER_BY_CONTENT)(:)/.exec(msg);
+  return m ? new Error(`${m[1]}#${id}${msg.slice(m[1].length)}`) : e;
+}
+
+async function fileAccessAllowed() {
+  try {
+    const { simulateNoFileAccess } = await chrome.storage.local.get('simulateNoFileAccess');
+    if (simulateNoFileAccess) return false;
+    if (chrome.extension?.isAllowedFileSchemeAccess) return await chrome.extension.isAllowedFileSchemeAccess();
+  } catch { /* unknown: let the browser decide */ }
+  return true;
+}
+
+// Files may only go to a frame whose own site the user allows (an embedded
+// frame from another site can be a different company's widget).
+async function ensureFrameSite(tabId, where) {
+  let url = '';
+  try {
+    if (where.sid) {
+      const r = await cdp(tabId, 'Runtime.evaluate', { expression: 'location.href', returnByValue: true }, 5000, where.sid);
+      url = r?.result?.value || '';
+    } else if (where.frameId) {
+      url = (await chrome.webNavigation.getFrame({ tabId, frameId: where.frameId }))?.url || '';
+    }
+  } catch { /* the frame is gone; nothing will be delivered to it */ }
+  if (url) await ensureSite(url);
+}
+
+const INPUT_INFO_FN = `function () {
+  const file = this.tagName === 'INPUT' && (this.type || '').toLowerCase() === 'file';
+  let disabled = !!this.disabled;
+  try { disabled = disabled || this.matches(':disabled'); } catch (e) {}
+  return { file, disabled, multiple: !!this.multiple, dir: !!(this.hasAttribute && this.hasAttribute('webkitdirectory')),
+    accept: this.getAttribute ? (this.getAttribute('accept') || '') : '', connected: !!this.isConnected,
+    id: this.id || '', name: this.name || '', label: (this.labels && this.labels[0] ? this.labels[0].textContent : (this.getAttribute && this.getAttribute('aria-label')) || '').replace(/\\s+/g, ' ').trim().slice(0, 60) };
+}`;
+const INPUT_FILES_FN = 'function () { return [...this.files].map((f) => ({ name: f.name, size: f.size, rel: f.webkitRelativePath || "" })); }';
+const INPUT_BYTES_FN = `function (files) {
+  const dt = new DataTransfer();
+  for (const f of files) {
+    const bin = atob(f.data); const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    const file = new File([u], f.name, { type: f.type || '', lastModified: f.lastModified || Date.now() });
+    // Folder uploads: pages read each file's path inside the chosen folder from this.
+    if (f.rel) Object.defineProperty(file, 'webkitRelativePath', { value: f.rel });
+    dt.items.add(file);
+  }
+  this.files = dt.files;
+  this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+  this.dispatchEvent(new Event('change', { bubbles: true }));
+}`;
+
+function acceptWarning(accept, files) {
+  const rules = String(accept || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  if (!rules.length) return '';
+  const ok = (f) => rules.some((r) => (r.startsWith('.') ? f.name.toLowerCase().endsWith(r)
+    : r.endsWith('/*') ? (f.type || '').toLowerCase().startsWith(r.slice(0, -1)) : (f.type || '').toLowerCase() === r));
+  const bad = files.filter((f) => !f.isDir && !ok(f)).map((f) => f.name);
+  return bad.length ? ` Note: the input asks for ${accept}; ${bad.join(', ')} may be rejected by the page.` : '';
+}
+
+const fmtSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
+
+// Puts files into a file input the debugger holds: by path (the browser reads
+// them from disk, any size, trusted events) or, when the extension may not
+// read local files, by content (bytes sent along by the bridge).
+async function setFilesOn(tabId, sid, node, p) {
+  try {
+    const info = await callOnNode(tabId, sid, node, INPUT_INFO_FN);
+    if (!info?.file) throw new Error('That element is not a file input. Pass the Upload button\'s ref instead, or via: "drop" for a drop zone.');
+    if (info.disabled) throw new Error('This file input is disabled: the page is not accepting files there right now. A person could not choose files here either.');
+    const files = p.files || [];
+    if (!files.length) throw new Error('paths is required: absolute paths of the files to upload.');
+    if (info.dir) {
+      if (files.length !== 1 || !files[0].isDir) throw new Error('This is a folder upload. Pass exactly one folder path.');
+    } else {
+      if (files.some((f) => f.isDir)) throw new Error('This input takes files, not folders. Pass file paths.');
+      if (!info.multiple && files.length > 1) throw new Error(`This input accepts only one file; you passed ${files.length}. Pass one path.`);
+    }
+    // Clearing first makes re-selecting the same file count as a change.
+    await callOnNode(tabId, sid, node, 'function () { this.value = ""; }');
+    if (p.bytes) {
+      await callOnNode(tabId, sid, node, INPUT_BYTES_FN, [p.bytes]);
+    } else {
+      try {
+        await cdp(tabId, 'DOM.setFileInputFiles', { files: files.map((f) => f.path), ...node }, 60000, sid);
+      } catch (e) { throw uploadError(e); }
+    }
+    // Folder contents are listed asynchronously after the call returns.
+    const readBack = async (tries) => {
+      let list = [];
+      for (let i = 0; i < tries; i++) {
+        list = (await callOnNode(tabId, sid, node, INPUT_FILES_FN)) || [];
+        if (list.length) break;
+        await sleep(100);
+      }
+      return list;
+    };
+    const got = await readBack(info.dir && !p.bytes ? 15 : 1);
+    if (info.dir && !p.bytes && !got.length && files[0].children?.length) {
+      // The browser does not list a folder handed over by an extension; the
+      // bridge resends the folder's files by content, with their paths.
+      throw new Error('FOLDER_BY_CONTENT: folder not listed by the browser.');
+    }
+    const shown = got.slice(0, 8).map((f) => `${f.rel || f.name} (${fmtSize(f.size)})`).join(', ');
+    const where = info.label ? ` "${info.label}"` : info.id ? ` #${info.id}` : info.name ? ` [name=${info.name}]` : '';
+    return `The file input${where} now holds ${got.length} file(s): ${shown}${got.length > 8 ? ', …' : ''}.`
+      + (info.connected ? '' : ' (The input is not part of the page; the page reads it from its own code.)')
+      + acceptWarning(info.accept, files)
+      + (p.bytes ? (p.bytesReason === 'folder' ? ' The folder\'s files were passed by content (up to 25 MB).' : ' Passed by content because "Allow access to file URLs" is off.') : '');
+  } finally {
+    releaseUploadObjects(tabId, sid);
+  }
+}
+
+function deepFindExpression(token) {
+  return `(() => {
+    const sel = '[data-hermes-bridge-target="${token}"]';
+    const seen = new Set();
+    const find = (root) => {
+      if (!root || seen.has(root)) return null;
+      seen.add(root);
+      const hit = root.querySelector(sel);
+      if (hit) return hit;
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot) { const h = find(el.shadowRoot); if (h) return h; }
+        if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+          let d = null; try { d = el.contentDocument; } catch (e) {}
+          if (d) { const h = find(d); if (h) return h; }
+        }
+      }
+      return null;
+    };
+    return find(document);
+  })()`;
+}
+
+function findTaggedNode(n, token) {
+  if (!n) return null;
+  const a = n.attributes || [];
+  for (let i = 0; i < a.length; i += 2) if (a[i] === 'data-hermes-bridge-target' && a[i + 1] === token) return n.backendNodeId;
+  for (const c of [...(n.children || []), ...(n.shadowRoots || []), n.contentDocument, n.templateContent].filter(Boolean)) {
+    const hit = findTaggedNode(c, token);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// Resolves a snapshot ref to the debugger session and node of its file input,
+// following a label, a wrapper, a sibling or aria-controls to the input.
+// Works in same-site and cross-site frames and in shadow DOM. Returns { tag }
+// only when no file input belongs to the element.
+async function resolveFileInput(tabId, fullRef) {
+  const { frameId, ref } = parseRef(fullRef);
+  const token = crypto.randomUUID();
+  const tag = await callFn(tabId, pageTag, { ref, token, retarget: true }, frameId);
+  if (!tag || tag.error) throw new Error(tag?.error || 'Could not locate element');
+  try {
+    if (!tag.isFile) return { tag, frameId };
+    const sid = frameId === 0 ? undefined : (await frameSession(tabId, frameId)) || undefined;
+    const r = await cdp(tabId, 'Runtime.evaluate', { expression: deepFindExpression(token), returnByValue: false, objectGroup: 'hermes-upload' }, 15000, sid);
+    if (r?.result?.objectId) return { tag, frameId, sid, node: { objectId: r.result.objectId } };
+    // Closed shadow roots and same-site frames of another origin: search the full DOM tree instead.
+    const doc = await cdp(tabId, 'DOM.getDocument', { depth: -1, pierce: true }, 30000, sid);
+    const backendNodeId = findTaggedNode(doc?.root, token);
+    cdp(tabId, 'DOM.disable', {}, 5000, sid).catch(() => {});
+    if (backendNodeId) return { tag, frameId, sid, node: { backendNodeId } };
+    throw new Error('Could not reach that file input. Take a new snapshot and try again, or pass the Upload button\'s ref.');
+  } finally {
+    callFn(tabId, pageTag, { token, remove: true }, frameId).catch(() => {});
+  }
+}
+
+async function describePending(tabId, p) {
+  if (!p.intercepted) {
+    return 'The page opened the system file picker in this tab, outside your own actions (probably the user). You cannot operate it; leave it to the user.';
+  }
+  if (!p.backendNodeId) {
+    return 'The page tried to open its File System Access file picker. It was blocked and the page treated it as cancelled. To upload, call upload_file with the same ref (or x/y) and paths; the picker is then answered with your files.';
+  }
+  let what = p.mode === 'selectMultiple' ? 'several files allowed' : 'one file';
+  try {
+    const info = await callOnNode(tabId, p.sid, { backendNodeId: p.backendNodeId }, INPUT_INFO_FN);
+    if (info?.dir) what = 'a folder';
+    if (info?.accept) what += `, accept=${JSON.stringify(info.accept)}`;
+  } catch { /* the input may be gone already */ } finally { releaseUploadObjects(tabId, p.sid); }
+  return `A file picker opened (${what}). No system dialog is showing. Call upload_file with paths (no ref needed) to choose the files, or upload_file with cancel: true to dismiss it.`;
+}
+
+// A note about a picker that opened since Hermes last heard about one.
+async function chooserNotice(tabId) {
+  const p = livePending(tabId);
+  if (!p || p.reported) return '';
+  p.reported = true;
+  return describePending(tabId, p);
+}
+
+// The page's File System Access picker can only be answered from inside the
+// page. The one-shot answer goes into every frame of the tab whose site the
+// user allows (the clicked element may sit in a same-site frame).
+async function injectFsaShim(tabId, files) {
+  const st = await siteState();
+  let frames = [];
+  try { frames = (await chrome.webNavigation.getAllFrames({ tabId })) || []; } catch { /* top frame only */ }
+  const ids = frames.filter((f) => f.frameId === 0 || siteVerdict(f.url || '', st) === 'allow').map((f) => f.frameId);
+  if (!ids.length) ids.push(0);
+  try {
+    const res = await chrome.scripting.executeScript({ target: { tabId, frameIds: ids }, world: 'MAIN', func: pageFsaShim, args: [files, CHOOSER_WINDOW_MS] });
+    return res.filter((r) => r.result).length;
+  } catch {
+    return 0;
+  }
+}
+
+async function fsaUsed(tabId) {
+  try {
+    const res = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: pageFsaUsed, world: 'ISOLATED' });
+    return res.map((r) => r.result).find((v) => Array.isArray(v)) || null;
+  } catch {
+    return null;
+  }
+}
+
+// Clicks an element the way a user would, with picker interception on, and
+// returns the picker it opened (or null).
+async function armedClick(tabId, pt) {
+  const since = Date.now();
+  await doClick(tabId, pt);
+  return waitChooser(tabId, since, CHOOSER_WINDOW_MS);
+}
+
+async function guardAll(tabId, phase) {
+  try {
+    const res = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: pageDropGuard, args: [{ phase }], world: 'ISOLATED' });
+    return res.map((r) => r.result).filter((v) => v && typeof v === 'object');
+  } catch {
+    return [];
+  }
+}
+
+async function dropFiles(tabId, p) {
+  // Dropping onto a file input itself is choosing files for it.
+  if (p.ref) {
+    const r = await resolveFileInput(tabId, p.ref);
+    if (r.node && !r.tag.retargeted) {
+      await ensureFrameSite(tabId, { frameId: r.frameId, sid: r.sid });
+      return 'That is a file input, so the files were chosen for it directly. ' + await setFilesOn(tabId, r.sid, r.node, p);
+    }
+  }
+  const pt = await pointFor(tabId, p);
+  const t = await inputTarget(tabId, pt);
+  const frameId = p.ref ? parseRef(p.ref).frameId : pt.frame ? pt.frame.id : 0;
+  await ensureFrameSite(tabId, { frameId, sid: t.sid });
+  const where = pt.desc ? ` on ${pt.desc}` : ` at (${pt.x}, ${pt.y})`;
+  const n = (p.files || []).length;
+  if (p.bytes) {
+    const local = p.ref ? { ref: parseRef(p.ref).ref } : pt.frame ? { x: pt.frame.x, y: pt.frame.y } : { x: pt.x, y: pt.y };
+    const r = await callFn(tabId, pagePutImage, { ...local, mode: 'drop', files: p.bytes }, frameId);
+    if (!r || r.error) throw new Error(r?.error || 'Could not drop the files');
+    return r.ok + ' (Passed by content because "Allow access to file URLs" is off.)';
+  }
+  const tab0 = await chrome.tabs.get(tabId);
+  const tabsBefore = new Set((await chrome.tabs.query({})).map((x) => x.id));
+  await guardAll(tabId, 'install');
+  const data = { items: [], files: p.files.map((f) => f.path), dragOperationsMask: 1 | 2 | 16 };
+  try {
+    for (const type of ['dragEnter', 'dragOver', 'drop']) {
+      await cdp(tabId, 'Input.dispatchDragEvent', { type, x: t.x, y: t.y, data }, 15000, t.sid);
+    }
+  } catch (e) {
+    cdp(tabId, 'Input.dispatchDragEvent', { type: 'dragCancel', x: t.x, y: t.y, data }, 5000, t.sid).catch(() => {});
+    guardAll(tabId, 'result');
+    throw uploadError(e);
+  }
+  await sleep(500);
+  const gs = await guardAll(tabId, 'result');
+  const g = {
+    dropped: gs.some((x) => x.dropped), handled: gs.some((x) => x.handled),
+    onInput: gs.some((x) => x.onInput), changed: gs.some((x) => x.changed),
+  };
+  // Safety net: if nothing took the drop, the browser may open the file as a page.
+  const opened = (await chrome.tabs.query({})).filter((x) => !tabsBefore.has(x.id) && /^file:/i.test(x.url || x.pendingUrl || ''));
+  for (const x of opened) chrome.tabs.remove(x.id).catch(() => {});
+  const now = await chrome.tabs.get(tabId).catch(() => null);
+  let navigated = false;
+  if (now && /^file:/i.test(now.url || now.pendingUrl || '') && !/^file:/i.test(tab0.url || '')) {
+    navigated = true;
+    await chrome.tabs.goBack(tabId).catch(() => {});
+  }
+  if (opened.length || navigated) return `Dropped ${n} file(s)${where}, but nothing on the page took them, so the browser tried to open the file itself (undone). This is probably not a drop zone.`;
+  if (g.onInput) return `Dropped ${n} file(s) onto a file input${where}; the browser fills it. Check with snapshot (selected=…).`;
+  if (g.handled && g.changed) return `Dropped ${n} file(s)${where}; the page accepted the drop and updated. Check with snapshot that the files appear.`;
+  if (g.handled) return `Dropped ${n} file(s)${where}; the page took the drop event but nothing on the page changed. Some pages catch drops everywhere; this may not be a drop zone for files. Check with snapshot.`;
+  if (g.dropped) return `Dropped ${n} file(s)${where}, but nothing on the page accepted the drop (it is probably not a drop zone). Check with snapshot.`;
+  return `Dropped ${n} file(s)${where}; the page did not report receiving them. Check with snapshot.`;
+}
+
+// Fills a picker that is waiting (opened by an earlier click, or by the first
+// attempt of this upload), and only that picker.
+async function fillPending(tabId, p, id) {
+  const c = livePending(tabId);
+  if (!c || c.id !== id || c.done || !c.intercepted || !c.backendNodeId) {
+    throw new Error('The file picker from before is no longer open (the page moved on, or it was answered). Call upload_file again with the Upload button\'s ref.');
+  }
+  await ensureFrameSite(tabId, { sid: c.sid });
+  c.done = true;
+  c.reported = true;
+  try {
+    const text = await setFilesOn(tabId, c.sid, { backendNodeId: c.backendNodeId }, p);
+    retireStalePickers(tabId, c.id);
+    return { text };
+  } catch (e) {
+    c.done = false; // still open: the agent can correct the call and try again
+    if (/^(FILE_ACCESS_DENIED|FOLDER_BY_CONTENT)/.test(String(e.message))) throw withPickerId(e, c.id);
+    throw e;
+  }
+}
+
+async function uploadFile(p, ctx) {
+  const tabId = await resolveTab(p, ctx);
+  const files = p.files || [];
+
+  if (p.cancel) {
+    const c = livePending(tabId);
+    if (!c || c.done || !c.backendNodeId || !c.intercepted) return { text: 'No file picker is waiting.' };
+    c.done = true;
+    c.reported = true;
+    await callOnNode(tabId, c.sid, { backendNodeId: c.backendNodeId }, 'function () { this.dispatchEvent(new Event("cancel", { bubbles: true })); }').catch(() => {});
+    releaseUploadObjects(tabId, c.sid);
+    return { text: 'Dismissed the file picker without choosing files.' };
+  }
+
+  if (p.clear) {
+    if (!p.ref) throw new Error('ref of the file input is required with clear.');
+    const r = await resolveFileInput(tabId, p.ref);
+    if (!r.node) throw new Error('That element is not a file input and has no file input of its own. Pass the file input\'s ref (snapshots list hidden ones under "Hidden file inputs").');
+    await callOnNode(tabId, r.sid, r.node, 'function () { this.value = ""; this.dispatchEvent(new Event("input", { bubbles: true, composed: true })); this.dispatchEvent(new Event("change", { bubbles: true })); }');
+    releaseUploadObjects(tabId, r.sid);
+    return { text: 'Cleared the file input.' };
+  }
+
+  if (!files.length) throw new Error('paths is required: absolute paths of the files to upload.');
+  const via = p.via || 'auto';
+  if (!['auto', 'input', 'chooser', 'drop', 'paste'].includes(via)) throw new Error('via must be auto, input, chooser, drop or paste.');
+
+  // A retry the bridge makes with the files' contents goes to the very picker
+  // its first attempt opened, never to another one.
+  if (p.retryPicker) return fillPending(tabId, p, p.retryPicker);
+
+  if (via === 'paste') {
+    if (!p.bytes) throw new Error('Internal: paste needs file contents from the bridge.');
+    if (p.ref) {
+      const r = await resolveFileInput(tabId, p.ref);
+      if (r.node && !r.tag.retargeted) {
+        await ensureFrameSite(tabId, { frameId: r.frameId, sid: r.sid });
+        return { text: 'That is a file input, so the files were chosen for it directly. ' + await setFilesOn(tabId, r.sid, r.node, { ...p, bytesReason: 'paste' }) };
+      }
+    }
+    const { frameId, ref } = p.ref ? parseRef(p.ref) : { frameId: 0, ref: null };
+    await ensureFrameSite(tabId, { frameId });
+    const r = await callFn(tabId, pagePutImage, { ref, x: p.x, y: p.y, mode: 'paste', files: p.bytes }, frameId);
+    if (!r || r.error) throw new Error(r?.error || 'Could not paste the files');
+    return { text: r.ok };
+  }
+
+  // Path-based uploads need the "Allow access to file URLs" switch; without it
+  // the bridge resends the call with the files' contents.
+  if (!p.bytes && !p.fsaFiles && !(await fileAccessAllowed())) throw new Error(FILE_ACCESS);
+
+  if (via === 'drop') {
+    if (!p.ref && typeof p.x !== 'number') throw new Error('ref (or x and y) of the drop zone is required with via: "drop".');
+    const text = await dropFiles(tabId, p);
+    retireStalePickers(tabId);
+    return { text };
+  }
+
+  // No target: answer the picker an earlier click opened.
+  if (!p.ref && typeof p.x !== 'number') {
+    const c = livePending(tabId);
+    if (c && !c.done && c.intercepted && c.backendNodeId) return fillPending(tabId, p, c.id);
+    throw new Error('No file picker is open. Pass ref: either the file input (snapshots list hidden ones too) or the Upload button, which is then clicked and its picker answered.');
+  }
+
+  // The element is a file input, or clearly belongs to one: fill it directly.
+  let tag = null;
+  if (p.ref && via !== 'chooser') {
+    const r = await resolveFileInput(tabId, p.ref);
+    tag = r.tag;
+    if (r.node) {
+      await ensureFrameSite(tabId, { frameId: r.frameId, sid: r.sid });
+      const text = await setFilesOn(tabId, r.sid, r.node, p);
+      retireStalePickers(tabId);
+      return { text };
+    }
+    if (via === 'input') throw new Error(`Element ${p.ref} is not a file input and has no file input of its own. Use the default via to click it and answer its picker.`);
+  }
+  if (tag?.submit) {
+    throw new Error(`${p.ref} is a form's submit button, not a file picker button: clicking it would submit the form. Give upload_file the form's file input first (snapshots list hidden ones under "Hidden file inputs"), then submit.`);
+  }
+
+  // Anything else is clicked like a user would, and the picker it opens is answered.
+  const pt = await pointFor(tabId, p);
+  ctx.pt = pt;
+  const before = (await chrome.tabs.get(tabId)).url;
+  const shim = p.fsaFiles ? await injectFsaShim(tabId, p.fsaFiles) : 0;
+  const c = await armedClick(tabId, pt);
+  if (shim) {
+    const used = await fsaUsed(tabId);
+    if (used) {
+      const unused = p.fsaFiles.map((f) => f.name).filter((n) => !used.includes(n));
+      retireStalePickers(tabId);
+      return {
+        text: `Answered the page's File System Access picker with ${used.join(', ')}.`
+          + (unused.length ? ` The page asked for one file, so ${unused.join(', ')} ${unused.length === 1 ? 'was' : 'were'} not used.` : '')
+          + ' (Passed by content; the page cannot save back to these files.)',
+      };
+    }
+  }
+  if (!c) {
+    const now = await chrome.tabs.get(tabId).catch(() => null);
+    const moved = now && (now.url !== before || now.status === 'loading');
+    const warned = (sessions.get(tabId)?.console || []).slice(-10).some((m) => /only be shown with a user activation/i.test(m.text));
+    throw new Error(`Clicked ${pt.desc || `(${pt.x}, ${pt.y})`} but no file picker opened.`
+      + (moved ? ` The click navigated the page${now.url !== before ? ` (now ${now.url})` : ''}; it was probably a link or a submit button, not an upload control.` : '')
+      + (warned ? ' The page tried to open one too late after the click (browsers allow 5 seconds).' : '')
+      + (moved ? '' : ' It may open a menu first (take a snapshot and choose e.g. "Upload from computer"), it may be a drop zone (use via: "drop"), or its file input may be listed under "Hidden file inputs" in a snapshot (pass that ref).'));
+  }
+  if (!c.intercepted) {
+    c.reported = true;
+    throw new Error('The click opened the system file dialog, which could not be captured; it is showing on the user\'s screen. Ask the user to choose the file there or to close it.');
+  }
+  if (!c.backendNodeId) {
+    c.reported = true;
+    if (p.fsaFiles) throw new Error('The page opened a File System Access folder or save picker (or captured the file picker before the answer was ready); an extension cannot answer those. If the page also has a drop zone or a regular upload input, use that.');
+    throw new Error('FSA_PICKER: the page uses the File System Access picker.');
+  }
+  return fillPending(tabId, p, c.id);
+}
+
+// After an extension restart, debugger sessions from before it may still be
+// attached (with picker interception possibly on). Release them.
+async function releaseOrphans() {
+  try {
+    const targets = await chrome.debugger.getTargets();
+    for (const t of targets) {
+      if (t.attached && t.tabId != null && !sessions.has(t.tabId)) chrome.debugger.detach({ tabId: t.tabId }).catch(() => {});
+    }
+  } catch { /* nothing to release */ }
+}
+
 async function releaseAll() {
   const ids = [...sessions.keys()];
   sessions.clear();
@@ -475,7 +1067,12 @@ async function releaseAll() {
   recordings.clear();
 }
 
-chrome.debugger.onDetach.addListener((source) => { if (source.tabId != null) sessions.delete(source.tabId); });
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId == null) return;
+  const fc = sessions.get(source.tabId)?.fc;
+  if (fc) { clearTimeout(fc.timer); for (const w of fc.waiters.splice(0)) w(null); }
+  sessions.delete(source.tabId);
+});
 chrome.tabs.onRemoved.addListener((tabId) => {
   sessions.delete(tabId); indicators.delete(tabId); frameInfo.delete(tabId); recordings.delete(tabId);
 });
@@ -484,13 +1081,43 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   const s = sessions.get(source.tabId);
   if (!s) return;
   if (method === 'Target.attachedToTarget') {
-    if (params.targetInfo?.type === 'iframe') s.children.set(params.sessionId, { url: params.targetInfo.url });
+    if (params.targetInfo?.type === 'iframe') {
+      s.children.set(params.sessionId, { url: params.targetInfo.url });
+      // Pickers inside a cross-site frame are reported by that frame's own session.
+      const t = { tabId: source.tabId, sessionId: params.sessionId };
+      chrome.debugger.sendCommand(t, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+      chrome.debugger.sendCommand(t, 'Page.enable', { enableFileChooserOpenedEvent: true }).then(async () => {
+        const fc = s.fc;
+        if (!fc || fc.armedUntil <= Date.now()) return;
+        fc.armedSids.add(params.sessionId);
+        await chrome.debugger.sendCommand(t, 'Page.setInterceptFileChooserDialog', { enabled: true });
+        // The window may have closed while this was being switched on.
+        if (fc.armedUntil <= Date.now() || !fc.armedSids.has(params.sessionId)) {
+          fc.armedSids.delete(params.sessionId);
+          chrome.debugger.sendCommand(t, 'Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+        }
+      }).catch(() => {});
+    }
     return;
   }
   if (method === 'Target.detachedFromTarget') {
     s.children.delete(params.sessionId);
     for (const [fid, sid] of s.frameSessions) if (sid === params.sessionId) s.frameSessions.delete(fid);
+    s.fc?.armedSids.delete(params.sessionId);
+    if (s.fc?.pending?.sid === params.sessionId) s.fc.pending = null;
     return;
+  }
+  if (method === 'Page.fileChooserOpened') {
+    const fc = fcState(s);
+    const sid = source.sessionId;
+    const intercepted = fc.armedSids.has(sidKey(sid));
+    fc.pending = { id: 'p' + (++pickerSeq), sid, frameId: params.frameId, mode: params.mode, backendNodeId: params.backendNodeId, intercepted, at: Date.now(), reported: false, done: !intercepted };
+    if (intercepted) disarmChooser(source.tabId);
+    for (const w of fc.waiters.splice(0)) w(fc.pending);
+    return;
+  }
+  if (method === 'Page.frameNavigated' && !source.sessionId && !params.frame?.parentId && s.fc) {
+    s.fc.pending = null;
   }
   if (method === 'Runtime.consoleAPICalled') {
     const text = (params.args || []).map((a) => (a.value !== undefined ? (typeof a.value === 'string' ? a.value : JSON.stringify(a.value)) : a.description || a.type)).join(' ');
@@ -749,7 +1376,8 @@ const HANDLERS = {
       text: `Extension ${chrome.runtime.getManifest().version} connected. `
         + (attached.length ? `Debugger attached to tab(s): ${attached.join(', ')} (the browser shows its debugging bar). ` : 'Debugger not attached to any tab (no debugging bar). ')
         + (siteMode === 'all' ? 'Site permissions: all sites allowed without asking (except any the user blocked).' :'Site permissions: the user is asked the first time you use each site.')
-        + (prompts.size ? ` Waiting for the user's answer about: ${[...prompts.keys()].join(', ')}.` : ''),
+        + (prompts.size ? ` Waiting for the user's answer about: ${[...prompts.keys()].join(', ')}.` : '')
+        + ((await fileAccessAllowed()) ? ' File uploads: by path, any size.' : ' File uploads: by content only, up to 25 MB, no folders ("Allow access to file URLs" is off for the extension).'),
     };
   },
 
@@ -1003,25 +1631,7 @@ const HANDLERS = {
   },
 
   async upload_file(p, ctx) {
-    const tabId = await resolveTab(p, ctx);
-    const paths = Array.isArray(p.paths) ? p.paths.map(String) : [];
-    if (!p.ref || !paths.length) throw new Error('ref (a file input from snapshot) and paths (absolute local file paths) are required.');
-    const { frameId, ref } = parseRef(p.ref);
-    if (frameId !== 0) throw new Error('File inputs inside embedded cross-origin frames are not supported by upload_file. For an image, upload_image works there.');
-    const token = crypto.randomUUID();
-    const tag = await callFn(tabId, pageTag, { ref, token });
-    if (!tag || tag.error) throw new Error(tag?.error || 'Could not locate element');
-    try {
-      if (tag.tag !== 'INPUT' || tag.type !== 'file') throw new Error(`Element ${p.ref} is not a file input. Pass the ref of the <input type="file"> (shown as file-input in the snapshot), not the button next to it.`);
-      if (tag.inFrame || tag.inShadow) throw new Error('File inputs inside iframes or shadow DOM are not supported by upload_file. For an image, upload_image works there.');
-      const r = await cdp(tabId, 'Runtime.evaluate', { expression: `document.querySelector('[data-hermes-bridge-target="${token}"]')` });
-      const objectId = r.result?.objectId;
-      if (!objectId) throw new Error('Could not resolve the file input.');
-      await cdp(tabId, 'DOM.setFileInputFiles', { files: paths, objectId });
-    } finally {
-      await callFn(tabId, pageTag, { ref, remove: true }).catch(() => {});
-    }
-    return { text: `Attached ${paths.length} file(s) to the file input.` };
+    return uploadFile(p, ctx);
   },
 
   async upload_image(p, ctx) {
@@ -1189,7 +1799,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ...Object.entries(st.sites).map(([host, rule]) => ({ host, rule })),
         ...Object.keys(st.sessionSites).filter((h) => !(h in st.sites)).map((host) => ({ host, rule: 'session' })),
       ].sort((a, b) => a.host.localeCompare(b.host));
-      sendResponse({ enabled: await isEnabled(), connected: authed, tabs, siteMode: st.siteMode, rules });
+      sendResponse({ enabled: await isEnabled(), connected: authed, tabs, siteMode: st.siteMode, rules, fileAccess: await fileAccessAllowed() });
     } catch (e) {
       sendResponse({ error: String(e?.message || e) });
     }

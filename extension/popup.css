@@ -11,6 +11,7 @@ header { display: flex; align-items: center; justify-content: space-between; gap
 h1 { font-size: 14px; margin: 0; }
 h2 { font-size: 12px; margin: 16px 0 6px; color: var(--muted); font-weight: 600; }
 .muted { color: var(--muted); }
+.note { margin: 10px 0 0; padding: 6px 8px; border: 1px solid var(--warn); border-radius: 6px; font-size: 12px; }
 .switch, .row { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .switch { white-space: nowrap; }
 .row { margin: 3px 0; }

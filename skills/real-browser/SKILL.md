@@ -33,6 +33,29 @@ Embedded frames from other sites are part of the snapshot; their refs look like
 `gif_recorder` (start, act, stop, export) saves a GIF of what you did and
 returns its path, useful to show the user a flow.
 
+## Uploading files
+
+Use `upload_file` with absolute paths; never click an upload button and wait for
+a system dialog (you cannot operate one).
+
+- `ref` can be the Upload/Browse button: it is clicked and the file picker it
+  opens is answered with your paths. It can also be a file input: snapshots
+  list hidden ones under "Hidden file inputs", including inputs in frames and
+  shadow DOM (`find` with "file input" locates them on long pages).
+- Not a form's submit button ("Upload", "Submit"): fill the form's file input,
+  then click submit.
+- If a click result says "A file picker opened", call `upload_file` with paths
+  and no ref, or with `cancel: true`.
+- Drop zones: `via: "drop"` with the zone's ref (snapshots mark them
+  `[drop-zone]`). Editors and chat boxes: `via: "paste"`.
+- Read the result: it lists the files the page now holds. For drops and
+  pastes, confirm with a snapshot that the files appear. Inputs without
+  "multiple" take one file; folder inputs take one folder path.
+- An embedded frame from another site needs its own site permission before
+  files go into it; a prompt may appear for it.
+- If the result says the user opened a picker themselves, leave it to them.
+- Only upload files the user asked you to upload.
+
 ## Site permissions
 
 The user approves each site. The first time you use a site, a prompt opens in

@@ -120,6 +120,45 @@ background tabs too.
 user would: into a file input, as a paste (`Ctrl+V` into an editor or chat box),
 or as a drag-and-drop onto a drop zone.
 
+### Uploading files
+
+`upload_file` uploads files from this computer the way a person would, without
+the system file dialog ever appearing:
+
+- **Upload buttons**: give it the button's ref. It clicks the button, catches the
+  file picker the page opens, and answers it with the files. This works for
+  hidden inputs behind styled buttons, labels, `showPicker()`, pickers opened
+  after a short delay, inputs the page never adds to the document, shadow DOM,
+  and frames from other sites, including in background tabs.
+- **File inputs**: snapshots list the hidden ones too, under "Hidden file
+  inputs", so they can be filled directly.
+- **Drop zones** (marked `[drop-zone]` in snapshots): `via: "drop"` performs a
+  real drag-and-drop with the files.
+- **Editors and chat boxes**: `via: "paste"` pastes the files.
+- **Pickers Hermes opened with a plain click** are reported in the click result,
+  and `upload_file` with only `paths` answers them (or `cancel: true`).
+- **File System Access pickers** (`showOpenFilePicker`, used by some web apps):
+  answered once, with the files' contents. The page cannot save back to them,
+  and they cannot be kept for later (a "recent files" list). Folder and save
+  pickers (`showDirectoryPicker`, `showSaveFilePicker`) cannot be answered.
+- **Safety rails**: a form's submit button is never clicked as if it were a
+  file picker; disabled inputs are refused; a drop that nothing on the page
+  takes cannot make the browser open your file as a page; files only go into
+  an embedded frame from another site once that site is allowed too; network
+  paths (`\\server\share`) are refused.
+
+The result lists the files the page now holds. Files go by path, so size does
+not matter and pages see the same events as with a real picker. When the
+browser's **Allow access to file URLs** switch is off for the extension, files
+go by content instead (up to 25 MB in total, events not marked as trusted), and
+the popup says so.
+
+**Your own file pickers are never taken over.** Picker capture is switched on
+only for about 5 seconds after each of Hermes' own actions in a tab. A picker
+you open yourself appears normally, and Hermes is only told that you have one
+open. It cannot fill it. The one overlap: if you open a picker in the same tab
+within those 5 seconds, it is caught and not shown to you; click again.
+
 **`gif_recorder`** records the actions Hermes takes in a tab (one frame per
 action, clicks marked with an orange circle) and saves an animated GIF to
 `~/.hermes-browser-bridge/recordings/`.
@@ -147,7 +186,7 @@ Know the edges before you switch on **Allow all sites**:
   It can run JavaScript in the page (`evaluate`), click, type and submit. Prefer
   the default ask-per-site mode, and block sites you never want it near (bank,
   email, admin consoles).
-- `upload_file` and `upload_image` with `path` read files from this computer and
+- `upload_file`, and `upload_image` with `path`, read files from this computer and
   hand them to the page. A prompt-injected agent could try to upload a private
   file to a site you allowed. Local-file pages (`file://`) count as the site
   "local files" and are allowed too in all-sites mode, if your browser's
@@ -163,12 +202,22 @@ Know the edges before you switch on **Allow all sites**:
 
 Found a security problem? Please open a private security advisory on the
 repository rather than a public issue.
+
 ## Limits
 
-- Site permissions apply to the tab's own site. Embedded frames from other sites
-  inside an allowed page are covered by that page's permission.
-- `upload_file` does not reach file inputs inside embedded frames from other
-  sites; `upload_image` does.
+- Site permissions apply to the tab's own site: reading and clicking inside
+  embedded frames from other sites is covered by the page's permission. Files,
+  however, only go into an embedded frame from another site once that site is
+  allowed too.
+- Folder uploads go by content (up to 25 MB and 1,000 files): browsers do not
+  list a folder handed over by an extension. Each file keeps its path inside
+  the folder.
+- Whole folders cannot be dropped or pasted, only files.
+- Some closed-source web apps may ignore pasted or content-passed files because
+  those events are not marked as trusted. Uploads by path, and drops, are
+  trusted.
+- Pages that open their picker more than 5 seconds after the click get no
+  picker at all. This is the browser's rule, and it applies to people too.
 - `chrome://` pages, the Web Store and other extensions' pages cannot be controlled.
 - One browser profile at a time: the most recently connected extension wins.
 - After Hermes starts, the extension can take up to 30 seconds to connect; the

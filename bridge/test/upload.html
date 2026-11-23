@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Upload Lab</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; }
+  section { margin: 10px 0; padding: 8px; border: 1px solid #ccc; }
+  .vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  #dropzone { width: 320px; height: 70px; background: #eef; border: 2px dashed #66a; }
+  #pastezone { width: 320px; min-height: 30px; border: 1px solid #333; }
+</style>
+</head>
+<body>
+<h1>Upload lab</h1>
+
+<!-- Every handler appends a record to window.__log so the test can see exactly what the page received. -->
+<script>
+  window.__log = [];
+  async function describe(files) {
+    return Promise.all([...files].map(async (f) => ({
+      name: f.name, size: f.size, type: f.type,
+      rel: f.webkitRelativePath || '',
+      head: f.size <= 1e6 ? (await f.text()).slice(0, 40) : '(large)',
+    })));
+  }
+  async function record(source, ev, files) {
+    window.__log.push({ source, trusted: ev ? ev.isTrusted : null, files: await describe(files || []) });
+  }
+  // React and other frameworks listen for change events at the document root.
+  window.addEventListener('message', (e) => { if (e.data && e.data.__uploadLab) window.__log.push(e.data.__uploadLab); });
+  document.addEventListener('change', (e) => {
+    if (e.target && e.target.type === 'file') window.__log.push({ source: 'root-change:' + (e.target.id || 'anon'), trusted: e.isTrusted, files: [] });
+  }, true);
+</script>
+
+<section>
+  <h2>Visible input</h2>
+  <label>Visible upload <input type="file" id="visible" multiple accept=".txt,.png,text/plain"></label>
+  <script>visible.addEventListener('change', (e) => record('visible', e, visible.files));</script>
+</section>
+
+<section>
+  <h2>Single-file input</h2>
+  <label>Single upload <input type="file" id="single"></label>
+  <script>single.addEventListener('change', (e) => record('single', e, single.files));</script>
+</section>
+
+<section>
+  <h2>PDF only</h2>
+  <label>PDF upload <input type="file" id="pdfonly" accept=".pdf,application/pdf"></label>
+  <script>pdfonly.addEventListener('change', (e) => record('pdfonly', e, pdfonly.files));</script>
+</section>
+
+<section>
+  <h2>Styled button, hidden input</h2>
+  <button id="hiddenBtn" type="button">Choose file</button>
+  <input type="file" id="hidden" style="display:none" multiple>
+  <script>
+    hiddenBtn.addEventListener('click', () => hidden.click());
+    hidden.addEventListener('change', (e) => record('hidden', e, hidden.files));
+  </script>
+</section>
+
+<section>
+  <h2>Label wrapping a hidden input</h2>
+  <label id="labelUpload" style="cursor:pointer; padding:4px; border:1px solid">Attach via label<input type="file" id="labelled" hidden></label>
+  <script>labelled.addEventListener('change', (e) => record('labelled', e, labelled.files));</script>
+</section>
+
+<section>
+  <h2>Visually hidden input (screen-reader pattern)</h2>
+  <label for="srOnly" id="srLabel" style="border:1px solid; padding:4px">Upload résumé</label>
+  <input type="file" id="srOnly" class="vh">
+  <script>srOnly.addEventListener('change', (e) => record('srOnly', e, srOnly.files));</script>
+</section>
+
+<section>
+  <h2>Picker opened after an async step</h2>
+  <button id="asyncBtn" type="button">Upload after delay</button>
+  <input type="file" id="asyncInput" hidden>
+  <script>
+    asyncBtn.addEventListener('click', async () => {
+      await new Promise((r) => setTimeout(r, 300));
+      asyncInput.click();
+    });
+    asyncInput.addEventListener('change', (e) => record('async', e, asyncInput.files));
+  </script>
+</section>
+
+<section>
+  <h2>showPicker()</h2>
+  <button id="showPickerBtn" type="button">Browse with showPicker</button>
+  <input type="file" id="showPickerInput" hidden>
+  <script>
+    showPickerBtn.addEventListener('click', () => showPickerInput.showPicker());
+    showPickerInput.addEventListener('change', (e) => record('showPicker', e, showPickerInput.files));
+  </script>
+</section>
+
+<section>
+  <h2>Input that is never added to the page</h2>
+  <button id="detachedBtn" type="button">Import from a detached input</button>
+  <script>
+    detachedBtn.addEventListener('click', () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.addEventListener('change', (e) => record('detached', e, input.files));
+      input.click();
+    });
+  </script>
+</section>
+
+<section>
+  <h2>Shadow DOM</h2>
+  <upload-widget id="widget"></upload-widget>
+  <script>
+    customElements.define('upload-widget', class extends HTMLElement {
+      connectedCallback() {
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = '<button type="button" id="b">Shadow upload</button><input type="file" id="i" hidden>';
+        const input = root.getElementById('i');
+        root.getElementById('b').addEventListener('click', () => input.click());
+        input.addEventListener('change', (e) => record('shadow', e, input.files));
+      }
+    });
+  </script>
+</section>
+
+<section>
+  <h2>Folder upload</h2>
+  <label>Folder upload <input type="file" id="folder" webkitdirectory></label>
+  <script>folder.addEventListener('change', (e) => record('folder', e, folder.files));</script>
+</section>
+
+<section>
+  <h2>Drop zone</h2>
+  <div id="dropzone" role="region" aria-label="Drop files here">Drop files here</div>
+  <script>
+    dropzone.addEventListener('dragover', (e) => e.preventDefault());
+    dropzone.addEventListener('drop', (e) => { e.preventDefault(); record('drop', e, e.dataTransfer.files); dropzone.textContent = 'Received ' + e.dataTransfer.files.length + ' file(s)'; });
+  </script>
+</section>
+
+<section>
+  <h2>Paste target</h2>
+  <div id="pastezone" role="textbox" aria-label="Paste files here" contenteditable="true"></div>
+  <script>
+    pastezone.addEventListener('paste', (e) => {
+      const files = e.clipboardData ? e.clipboardData.files : [];
+      if (files.length) { e.preventDefault(); record('paste', e, files); pastezone.dataset.got = files.length; }
+    });
+  </script>
+</section>
+
+<section>
+  <h2>Disabled input</h2>
+  <label>Disabled upload <input type="file" id="disabledInput" disabled></label>
+  <script>disabledInput.addEventListener('change', (e) => record('disabled', e, disabledInput.files));</script>
+</section>
+
+<section>
+  <h2>Form with a submit button</h2>
+  <form id="photoForm" action="/second" method="get">
+    <input type="file" id="photo" name="photo" style="display:none">
+    <input type="submit" id="photoSubmit" value="Upload Image">
+  </form>
+  <form id="plainForm" action="/second" method="get">
+    <input type="text" name="q" aria-label="Search text">
+    <button type="submit" id="plainSubmit">Upload report</button>
+  </form>
+  <script>photo.addEventListener('change', (e) => record('photo', e, photo.files));</script>
+</section>
+
+<section>
+  <h2>Drop zone with a nested label</h2>
+  <div id="nestedZone" style="border:2px dashed #888; height:80px; width:320px"><p>Drop files here</p></div>
+  <script>
+    nestedZone.addEventListener('dragover', (e) => e.preventDefault());
+    nestedZone.addEventListener('drop', (e) => { e.preventDefault(); record('nestedDrop', e, e.dataTransfer.files); nestedZone.firstElementChild.textContent = 'Got it'; });
+  </script>
+  <ul><li id="marketing">Drag n' drop to reorder files</li><li>Upload on drop or wait for user action</li></ul>
+</section>
+
+<main style="display:contents"><section><h2>Inside display contents</h2><button type="button" id="contentsBtn">Contents button</button></section></main>
+
+<section>
+  <h2>File System Access API</h2>
+  <button id="fsapiBtn" type="button">Open with file system picker</button>
+  <script>
+    fsapiBtn.addEventListener('click', async () => {
+      try {
+        if (!window.showOpenFilePicker) throw Object.assign(new Error('unsupported'), { name: 'NotSupported' });
+        const handles = await window.showOpenFilePicker({ multiple: false });
+        const files = await Promise.all(handles.map((h) => h.getFile()));
+        window.__log.push({ source: 'fsapi', trusted: null, files: await describe(files) });
+      } catch (err) {
+        window.__log.push({ source: 'fsapi-error', error: err.name, files: [] });
+      }
+    });
+  </script>
+</section>
+
+<section>
+  <h2>Embedded frames</h2>
+  <iframe id="sameFrame" title="same-site upload frame" src="/upload-frame" style="width:360px;height:90px"></iframe>
+  <iframe id="crossFrame" title="cross-site upload frame" src="CROSS_ORIGIN/upload-frame" style="width:380px;height:150px"></iframe>
+</section>
+
+<div style="height:1500px"></div>
+</body>
+</html>

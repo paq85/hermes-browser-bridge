@@ -15,6 +15,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from '../vendor/ws/wrapper.mjs';
+import { uploadTests } from './uploads.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // Everything runs against a private copy of the extension with its own port and
@@ -134,6 +135,16 @@ function jpegSize(b64) {
 let cross = '';
 const web = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/html' });
+  if (req.url === '/upload-nested') {
+    res.end('<!doctype html><button id=b type=button>Nested upload button</button><input type=file id=i hidden>'
+      + '<script>b.onclick=()=>i.click();i.onchange=async(e)=>{const f=i.files[0];top.postMessage({__uploadLab:{source:"nested@"+location.hostname,trusted:e.isTrusted,files:[{name:f.name,size:f.size,type:f.type,rel:"",head:(await f.text()).slice(0,40)}]}},"*")}</script>');
+    return;
+  }
+  if (req.url === '/upload' || req.url === '/upload-frame') {
+    const file = path.join(here, req.url === '/upload' ? 'upload.html' : 'upload-frame.html');
+    res.end(fs.readFileSync(file, 'utf8').replace('CROSS_ORIGIN', cross));
+    return;
+  }
   res.end(req.url === '/frame' ? FRAME : req.url === '/second' ? SECOND : req.url === '/cross' ? CROSS : page(cross));
 });
 await new Promise((r) => web.listen(0, r));
@@ -231,6 +242,9 @@ try {
   check('site prompt: "Always allow" lets the call through', asked === '127.0.0.1' && !r.isError && /Bridge Test/.test(r.text), `${asked} | ${r.text}`);
   r = await a.tool('status');
   check('status reports ask-per-site mode', /asked the first time/.test(r.text), r.text);
+  const uploadCtx = { a, base, cross, check, refFor, sandbox, dbgPort };
+  // HBB_ONLY_UPLOADS=1 runs just the upload tests (quicker while working on them).
+  if (process.env.HBB_ONLY_UPLOADS) { await uploadTests(uploadCtx); throw Object.assign(new Error('done'), { skipRest: true }); }
 
   // "Allow all sites": from the prompt itself, and from the toolbar popup.
   const third = `http://[::1]:${web.address().port}`; // a host with no rule of its own
@@ -356,12 +370,12 @@ try {
   check('upload_image into a file input', got === 'screenshot.jpg:image/jpeg:true', r.text + ' / ' + got);
   r = await a.tool('upload_image', { ref: refFor(snap2, /textbox "Paste zone" \[ref=(e\d+)\]/), filename: 'shot.jpg' });
   got = (await a.tool('evaluate', { expression: 'pastezone.dataset.got' })).text;
-  check('upload_image as a paste', got === 'shot.jpg:image/jpeg:true' && /accepted/.test(r.text), r.text + ' / ' + got);
+  check('upload_image as a paste', got === 'shot.jpg:image/jpeg:true' && /took it/.test(r.text), r.text + ' / ' + got);
   const pngFile = path.join(sandbox, 'tiny.png');
   fs.writeFileSync(pngFile, Buffer.from(TINY_PNG, 'base64'));
   r = await a.tool('upload_image', { ref: refFor(snap2, /button "Drop zone" \[ref=(e\d+)\]/), mode: 'drop', path: pngFile });
   got = (await a.tool('evaluate', { expression: 'dropzone.dataset.got' })).text;
-  check('upload_image of a file as a drop', got === 'tiny.png:image/png' && /accepted/.test(r.text), r.text + ' / ' + got);
+  check('upload_image of a file as a drop', got === 'tiny.png:image/png' && /took it/.test(r.text), r.text + ' / ' + got);
 
   // GIF recording.
   r = await a.tool('gif_recorder', { action: 'start' });
@@ -412,6 +426,8 @@ try {
   r = await a.tool('click', { ref: 'e9999' });
   check('stale ref gives a clear error', r.isError && /snapshot/.test(r.text), r.text);
 
+  await uploadTests(uploadCtx);
+
   r = await a.tool('tab_new', { url: base + '/second' });
   await a.tool('click', { x: 5, y: 5 });
   const during = (await a.tool('status')).text;
@@ -435,6 +451,9 @@ try {
   r = await b.tool('get_text');
   check(`failover after hub exit (${Math.round((Date.now() - t0) / 1000)} s)`, !r.isError && /Bridge test page/.test(r.text), r.text);
   b.stop();
+} catch (err) {
+  if (!err.skipRest) throw err;
+
 } finally {
   chrome.kill();
   web.close();
